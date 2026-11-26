@@ -1,0 +1,76 @@
+
+name: Build Potassium Mobile unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Unpack source archive
+        run: |
+          test -f PotassiumMobile-source.zip
+          unzip -q PotassiumMobile-source.zip
+          test -f PotassiumMobile/project.yml
+
+      - name: Install build tools
+        run: |
+          brew list --versions cmake >/dev/null 2>&1 || brew install cmake
+          brew list --versions xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      - name: Verify source files
+        working-directory: PotassiumMobile
+        run: bash ./Scripts/verify-source.sh
+
+      - name: Build Luau iOS libraries
+        working-directory: PotassiumMobile
+        run: bash ./Scripts/build-luau-ios.sh
+
+      - name: Generate Xcode project
+        working-directory: PotassiumMobile
+        run: xcodegen generate
+
+      - name: Build unsigned iOS app
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/PotassiumDerivedData
+        run: |
+          xcodebuild \
+            -project PotassiumMobile/PotassiumMobile.xcodeproj \
+            -scheme PotassiumMobile \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build
+
+      - name: Package unsigned IPA
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/PotassiumDerivedData
+        run: |
+          APP="$DERIVED_DATA/Build/Products/Release-iphoneos/PotassiumMobile.app"
+          test -d "$APP"
+          OUT="$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$OUT/Payload"
+          ditto "$APP" "$OUT/Payload/PotassiumMobile.app"
+          (cd "$OUT" && /usr/bin/zip -qry "$GITHUB_WORKSPACE/PotassiumMobile-unsigned.ipa" Payload)
+          test -s "$GITHUB_WORKSPACE/PotassiumMobile-unsigned.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PotassiumMobile-unsigned-IPA
+          path: PotassiumMobile-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
