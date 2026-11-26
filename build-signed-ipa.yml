@@ -1,0 +1,202 @@
+name: Build signed Potassium Mobile IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "Must match the provisioning profile you own"
+        required: true
+        type: choice
+        options:
+          - development
+          - ad-hoc
+        default: development
+
+permissions:
+  contents: read
+
+jobs:
+  build-signed:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      APP_BUNDLE_ID: app.potassium.mobile
+      KEYCHAIN_PATH: ${{ runner.temp }}/potassium-signing.keychain-db
+      PROFILE_PATH: ${{ runner.temp }}/potassium.mobileprovision
+      P12_PATH: ${{ runner.temp }}/potassium-signing.p12
+      ARCHIVE_PATH: ${{ runner.temp }}/PotassiumMobile.xcarchive
+      EXPORT_PATH: ${{ runner.temp }}/signed-export
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Unpack source archive
+        run: |
+          set -euo pipefail
+          test -f PotassiumMobile-source.zip
+          unzip -q PotassiumMobile-source.zip
+          test -f PotassiumMobile/project.yml
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew list --versions cmake >/dev/null 2>&1 || brew install cmake
+          brew list --versions xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      - name: Validate and install owned signing credentials
+        env:
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_MOBILEPROVISION_BASE64: ${{ secrets.IOS_MOBILEPROVISION_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+        run: |
+          set -euo pipefail
+          : "${IOS_P12_BASE64:?Missing repository secret IOS_P12_BASE64}"
+          : "${IOS_P12_PASSWORD:?Missing repository secret IOS_P12_PASSWORD}"
+          : "${IOS_MOBILEPROVISION_BASE64:?Missing repository secret IOS_MOBILEPROVISION_BASE64}"
+          : "${KEYCHAIN_PASSWORD:?Missing repository secret IOS_KEYCHAIN_PASSWORD}"
+
+          printf '%s' "$IOS_P12_BASE64" | base64 -D > "$P12_PATH"
+          printf '%s' "$IOS_MOBILEPROVISION_BASE64" | base64 -D > "$PROFILE_PATH"
+          test -s "$P12_PATH"
+          test -s "$PROFILE_PATH"
+
+          security cms -D -i "$PROFILE_PATH" > "$RUNNER_TEMP/profile.plist"
+          PROFILE_APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          PROFILE_GET_TASK_ALLOW=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$RUNNER_TEMP/profile.plist" 2>/dev/null || echo false)
+
+          case "$PROFILE_APP_ID" in
+            "$TEAM_ID.$APP_BUNDLE_ID"|"$TEAM_ID.*") ;;
+            *)
+              echo "Provisioning profile App ID does not cover $APP_BUNDLE_ID." >&2
+              echo "Profile App ID: $PROFILE_APP_ID" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$EXPORT_METHOD" in
+            development)
+              if [[ "$PROFILE_GET_TASK_ALLOW" != "true" ]]; then
+                echo "Selected development export, but profile is not a development profile." >&2
+                exit 1
+              fi
+              SIGNING_IDENTITY_NAME="Apple Development"
+              ;;
+            ad-hoc)
+              if [[ "$PROFILE_GET_TASK_ALLOW" == "true" ]]; then
+                echo "Selected ad-hoc export, but profile is a development profile." >&2
+                exit 1
+              fi
+              DEVICE_COUNT=$(/usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$RUNNER_TEMP/profile.plist" 2>/dev/null | grep -c '^[[:space:]]*[0-9][0-9]* =' || true)
+              if [[ "$DEVICE_COUNT" -eq 0 ]]; then
+                echo "Ad-hoc profile must contain registered device UDIDs." >&2
+                exit 1
+              fi
+              SIGNING_IDENTITY_NAME="Apple Distribution"
+              ;;
+            *) echo "Unsupported export method: $EXPORT_METHOD" >&2; exit 1 ;;
+          esac
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "$IOS_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          IDENTITY_LINE=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "$SIGNING_IDENTITY_NAME" | head -n 1 || true)
+          if [[ -z "$IDENTITY_LINE" ]]; then
+            echo "No $SIGNING_IDENTITY_NAME identity found in supplied P12." >&2
+            exit 1
+          fi
+          SIGNING_IDENTITY=$(printf '%s' "$IDENTITY_LINE" | sed -E 's/^.*[[:space:]]([0-9A-F]{40})[[:space:]]".*"$/\1/')
+          if [[ "$IDENTITY_LINE" != *"($TEAM_ID)"* ]]; then
+            echo "The P12 signing certificate Team ID does not match the provisioning profile Team ID $TEAM_ID." >&2
+            exit 1
+          fi
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          {
+            echo "TEAM_ID=$TEAM_ID"
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "SIGNING_IDENTITY=$SIGNING_IDENTITY"
+            echo "SIGNING_IDENTITY_NAME=$SIGNING_IDENTITY_NAME"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify source
+        working-directory: PotassiumMobile
+        run: bash ./Scripts/verify-source.sh
+
+      - name: Build Luau for iOS
+        working-directory: PotassiumMobile
+        run: bash ./Scripts/build-luau-ios.sh
+
+      - name: Generate Xcode project
+        working-directory: PotassiumMobile
+        run: xcodegen generate
+
+      - name: Archive signed app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project PotassiumMobile/PotassiumMobile.xcodeproj \
+            -scheme PotassiumMobile \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$APP_BUNDLE_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            CODE_SIGNING_ALLOWED=YES \
+            archive
+
+      - name: Export signed IPA
+        env:
+          EXPORT_METHOD: ${{ inputs.export_method }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$EXPORT_PATH"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>${SIGNING_IDENTITY_NAME}</string>
+            <key>provisioningProfiles</key>
+            <dict><key>${APP_BUNDLE_ID}</key><string>${PROFILE_UUID}</string></dict>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+          IPA=$(find "$EXPORT_PATH" -maxdepth 1 -name '*.ipa' -type f | head -n 1)
+          test -n "$IPA"
+          cp "$IPA" "$GITHUB_WORKSPACE/PotassiumMobile-signed.ipa"
+          test -s "$GITHUB_WORKSPACE/PotassiumMobile-signed.ipa"
+
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PotassiumMobile-signed-IPA
+          path: PotassiumMobile-signed.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Clean signing materials
+        if: always()
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          rm -f "$P12_PATH" "$PROFILE_PATH"
